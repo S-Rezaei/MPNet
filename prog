@@ -1,0 +1,1247 @@
+import os
+import re
+import copy
+import random
+import warnings
+import gc
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+import timm
+from torchvision import models
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    roc_auc_score,
+    precision_recall_fscore_support
+)
+from sklearn.model_selection import StratifiedGroupKFold
+from xgboost import XGBClassifier
+
+warnings.filterwarnings("ignore")
+
+# -----------------------------
+# Config
+# -----------------------------
+DATA_DIR = (
+    r"C:\Users\Windows\Desktop\data"
+)
+
+CSV_PATH = (
+    r"C:\Users\Windows\Desktop\prog.csv"
+)
+
+IMG_SIZE = 224
+BATCH_SIZE = 4
+EPOCHS = 35
+
+SEED = 42
+EARLY_STOPPING_PATIENCE = 12
+N_OUTER_SPLITS = 5
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PIN_MEMORY = DEVICE.type == "cuda"
+
+LABEL_COLUMN = "label"
+
+CLASS_NAMES = ["sMCI", "pMCI"]
+CLASS_TO_IDX = {"sMCI": 0, "pMCI": 1}
+NUM_CLASSES = len(CLASS_NAMES)
+
+LABEL_MAP = {
+    "0": "sMCI", "1": "pMCI"
+}
+MOCA_STATUS_COL = "MOCA_status"
+MOCA_STATUS_CODE = "MOCA_status_code"
+
+VALID_EXTENSIONS = (".npy",)
+
+PTID_PATTERN = re.compile(r"\d{3}_S_\d{4}")
+IMAGEID_PATTERN = re.compile(r"(?:^|_)I(\d+)(?:_|\.|$)", re.IGNORECASE)
+
+CLINICAL_COLS = [
+    "mci_AGE",
+    "mci_gender",
+    "mci_education",
+    "MOCA",
+    "MMSE",
+    "FAQ",
+    "ABETA",
+    "TAU",
+    "PTAU",
+    MOCA_STATUS_CODE    
+]
+
+# -----------------------------
+# Reproducibility
+# -----------------------------
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+set_seed(SEED)
+
+# -----------------------------
+# 9-Slice Tensor Transforms
+# -----------------------------
+class NineSliceTransform:
+    def __init__(self, is_training=True, img_size=224):
+        self.is_training = is_training
+        self.img_size = img_size
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        tensor = F.interpolate(
+            tensor,
+            size=(self.img_size, self.img_size),
+            mode="bilinear",
+            align_corners=False
+        )
+
+        if self.is_training:
+            angle = random.uniform(-5, 5)
+            tensor = self._rotate_tensor(tensor, angle)
+
+            tx = random.uniform(-0.02, 0.02) * self.img_size
+            ty = random.uniform(-0.02, 0.02) * self.img_size
+            tensor = self._translate_tensor(tensor, tx, ty)
+
+        for slice_idx in range(tensor.shape[0]):
+            mean = tensor[slice_idx].mean()
+            std = tensor[slice_idx].std() + 1e-8
+            tensor[slice_idx] = (tensor[slice_idx] - mean) / std
+
+        return tensor
+
+    def _rotate_tensor(self, tensor: torch.Tensor, angle: float) -> torch.Tensor:
+        alpha = angle * np.pi / 180.0
+        theta = torch.tensor(
+            [
+                [np.cos(alpha), -np.sin(alpha), 0],
+                [np.sin(alpha),  np.cos(alpha), 0]
+            ],
+            dtype=torch.float32
+        ).unsqueeze(0).repeat(tensor.size(0), 1, 1)
+
+        theta = theta.to(tensor.device)
+        grid = F.affine_grid(theta, tensor.size(), align_corners=False)
+        return F.grid_sample(tensor, grid, align_corners=False)
+
+    def _translate_tensor(self, tensor: torch.Tensor, tx: float, ty: float) -> torch.Tensor:
+        theta = torch.tensor(
+            [
+                [1, 0, tx / (self.img_size / 2)],
+                [0, 1, ty / (self.img_size / 2)]
+            ],
+            dtype=torch.float32
+        ).unsqueeze(0).repeat(tensor.size(0), 1, 1)
+
+        theta = theta.to(tensor.device)
+        grid = F.affine_grid(theta, tensor.size(), align_corners=False)
+        return F.grid_sample(tensor, grid, align_corners=False)
+
+train_transform = NineSliceTransform(is_training=True, img_size=IMG_SIZE)
+val_transform = NineSliceTransform(is_training=False, img_size=IMG_SIZE)
+
+# -----------------------------
+# Data Helpers
+# -----------------------------
+def normalize_text(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip().replace('"', "").replace("'", "")
+
+def normalize_filename(name):
+    return os.path.basename(normalize_text(name))
+
+def remove_known_extension(name):
+    name = normalize_filename(name)
+    root, ext = os.path.splitext(name)
+    if ext.lower() in VALID_EXTENSIONS or ext.lower() in (".png", ".jpg", ".jpeg"):
+        return root
+    return name
+
+def normalize_ptid(ptid):
+    text = normalize_text(ptid)
+    match = PTID_PATTERN.search(text)
+    return match.group(0) if match else ""
+
+def normalize_imageid(imageid_ext):
+    text = normalize_text(imageid_ext)
+    if not text:
+        return ""
+    if text.endswith(".0"):
+        text = text[:-2]
+    match = re.search(r"I?(\d+)", text, flags=re.IGNORECASE)
+    return match.group(1) if match else ""
+
+def normalize_label(value):
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    mapped = LABEL_MAP.get(text, text)
+    if mapped in CLASS_TO_IDX:
+        return mapped
+    return None
+
+def extract_ptid_from_name(name):
+    text = normalize_filename(name)
+    match = PTID_PATTERN.search(text)
+    return match.group(0) if match else ""
+
+def extract_imageid_from_name(name):
+    text = normalize_filename(name)
+    match = IMAGEID_PATTERN.search(text)
+    return match.group(1) if match else ""
+
+def resolve_row_ptid(row):
+    ptid = normalize_ptid(row.get("PTID", ""))
+    if ptid:
+        return ptid
+    return extract_ptid_from_name(row.get("mci_output_npy", ""))
+
+def resolve_row_imageid(row):
+    imageid = normalize_imageid(row.get("IMAGEID_ext", ""))
+    if imageid:
+        return imageid
+    return extract_imageid_from_name(row.get("mci_output_npy", ""))
+
+def parse_moca_status(val):
+    if pd.isna(val):
+        return np.nan
+    text = str(val).strip()
+    if not text:
+        return np.nan
+    low = text.lower()
+    if "imputed" in low:
+        m = re.search(r"(\d+)\s+prior", low)
+        if m:
+            return float(m.group(1))
+        return 1.0
+    return 0.0 
+    
+def infer_file_name_type(file_name):
+    base = normalize_filename(file_name)
+    if re.fullmatch(r"\d{3}_S_\d{4}_I\d+.*", base, flags=re.IGNORECASE):
+        return "short_ptid_imageid"
+    if base.upper().startswith("ADNI_") and PTID_PATTERN.search(base) and IMAGEID_PATTERN.search(base):
+        return "long_adni_name"
+    return "unknown"
+
+def collect_all_images(data_dir):
+    all_paths = []
+    for root_dir, _, files in os.walk(data_dir):
+        for file_name in files:
+            if file_name.lower().endswith(VALID_EXTENSIONS):
+                all_paths.append(os.path.join(root_dir, file_name))
+    return all_paths
+
+def build_image_indices(data_dir):
+    all_paths = collect_all_images(data_dir)
+    by_exact_filename = {}
+    by_stem_filename = {}
+    by_ptid = {}
+    by_ptid_imageid = {}
+
+    for path in all_paths:
+        base = os.path.basename(path)
+        base_norm = normalize_filename(base)
+        stem_norm = remove_known_extension(base)
+        ptid = extract_ptid_from_name(base)
+        imageid = extract_imageid_from_name(base)
+
+        by_exact_filename.setdefault(base_norm, []).append(path)
+        by_stem_filename.setdefault(stem_norm, []).append(path)
+        if ptid:
+            by_ptid.setdefault(ptid, []).append(path)
+        if ptid and imageid:
+            by_ptid_imageid.setdefault((ptid, imageid), []).append(path)
+
+    return {
+        "by_exact_filename": by_exact_filename,
+        "by_stem_filename": by_stem_filename,
+        "by_ptid": by_ptid,
+        "by_ptid_imageid": by_ptid_imageid,
+    }
+
+def choose_best_match(candidates, ptid="", imageid=""):
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if ptid:
+        folder_matches = [
+            path for path in candidates
+            if os.path.basename(os.path.dirname(path)) == ptid
+        ]
+        if len(folder_matches) == 1:
+            return folder_matches[0]
+        if folder_matches:
+            candidates = folder_matches
+
+    if imageid:
+        token = f"I{imageid}"
+        image_matches = [
+            path for path in candidates
+            if token.lower() in os.path.basename(path).lower()
+        ]
+        if len(image_matches) == 1:
+            return image_matches[0]
+        if image_matches:
+            candidates = image_matches
+
+    return candidates[0]
+
+def find_image_path(row, indices):
+    file_name = row.get("mci_output_npy", "")
+    file_name_stem = remove_known_extension(file_name)
+    file_name_norm = file_name_stem + ".npy"
+
+    ptid = resolve_row_ptid(row)
+    imageid = resolve_row_imageid(row)
+
+    exact_matches = indices["by_exact_filename"].get(file_name_norm, [])
+    best = choose_best_match(exact_matches, ptid=ptid, imageid=imageid)
+    if best is not None:
+        return best
+
+    stem_matches = indices["by_stem_filename"].get(file_name_stem, [])
+    best = choose_best_match(stem_matches, ptid=ptid, imageid=imageid)
+    if best is not None:
+        return best
+
+    if ptid and imageid:
+        pair_matches = indices["by_ptid_imageid"].get((ptid, imageid), [])
+        best = choose_best_match(pair_matches, ptid=ptid, imageid=imageid)
+        if best is not None:
+            return best
+
+    if ptid:
+        ptid_matches = indices["by_ptid"].get(ptid, [])
+        if imageid:
+            token = f"I{imageid}"
+            filtered = [
+                path for path in ptid_matches
+                if token.lower() in os.path.basename(path).lower()
+            ]
+            best = choose_best_match(filtered, ptid=ptid, imageid=imageid)
+            if best is not None:
+                return best
+    return None
+
+def clean_biomarker(val):
+    if pd.isna(val):
+        return np.nan
+    if isinstance(val, str):
+        cleaned = re.sub(r"[<>\s,]", "", val)
+        try:
+            return float(cleaned)
+        except ValueError:
+            return np.nan
+    return float(val)
+
+def preprocess_clinical_data(df: pd.DataFrame, clinical_cols: List[str]) -> pd.DataFrame:
+    df = df.copy()
+    missing_tokens = ["", " ", "NA", "N/A", "na", "n/a", "null", "None", "none", "missing"]
+
+    for col in clinical_cols:
+        if col not in df.columns:
+            df[col] = np.nan
+    if MOCA_STATUS_COL in df.columns:
+        df[MOCA_STATUS_CODE] = df[MOCA_STATUS_COL].apply(parse_moca_status)
+    df[clinical_cols] = df[clinical_cols].replace(missing_tokens, np.nan)
+
+    for col in clinical_cols:
+        if col == "mci_gender":
+            df[col] = df[col].astype(str).str.strip().str.upper().map(
+                {"F": 0, "FEMALE": 0, "0": 0, "M": 1, "MALE": 1, "1": 1}
+            ).fillna(np.nan)
+        else:
+            df[col] = df[col].apply(clean_biomarker)
+
+    return df
+
+def build_samples_from_csv(csv_path, data_dir, label_column):
+    df = pd.read_csv(csv_path)
+
+    required_columns = ["mci_output_npy", label_column]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing columns in CSV: {missing_columns}")
+
+    df = preprocess_clinical_data(df, CLINICAL_COLS)
+
+    if "PTID" not in df.columns:
+        df["PTID"] = ""
+    if "IMAGEID_ext" not in df.columns:
+        df["IMAGEID_ext"] = ""
+
+    df["resolved_ptid"] = df.apply(resolve_row_ptid, axis=1)
+    df["resolved_imageid"] = df.apply(resolve_row_imageid, axis=1)
+    df["label_name"] = df[label_column].apply(normalize_label)
+    df["label_idx"] = df["label_name"].apply(lambda x: CLASS_TO_IDX.get(x, -1))
+
+    indices = build_image_indices(data_dir)
+    samples = []
+    missing_image_count = 0
+
+    for _, row in df.iterrows():
+        if row["label_idx"] == -1:
+            continue
+
+        image_path = find_image_path(row, indices)
+        if image_path is None:
+            missing_image_count += 1
+            continue
+
+        ptid = row["resolved_ptid"]
+        if not ptid:
+            ptid = extract_ptid_from_name(os.path.basename(image_path))
+
+        imageid = row["resolved_imageid"]
+        if not imageid:
+            imageid = extract_imageid_from_name(os.path.basename(image_path))
+
+        sample_dict = {
+            "path": image_path,
+            "label": int(row["label_idx"]),
+            "PTID": ptid,
+            "IMAGEID": imageid,
+            "source_file_name": normalize_filename(row["mci_output_npy"]),
+            "file_type": infer_file_name_type(row["mci_output_npy"]),
+        }
+
+        for col in CLINICAL_COLS:
+            sample_dict[col] = row[col]
+
+        samples.append(sample_dict)
+
+    samples_df = pd.DataFrame(samples).drop_duplicates(subset=["path", "label"])
+    print(f"Matched samples: {len(samples_df)}")
+    print(f"Rows skipped only because image not found: {missing_image_count}")
+    return samples_df
+
+# -----------------------------
+# Clinical OOF
+# -----------------------------
+def get_oof_clinical_predictions(
+    train_val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    clinical_cols: List[str],
+    label_col: str = "label",
+    n_splits: int = 5,
+    random_state: int = 42
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, XGBClassifier]:
+    train_val_probs = np.full((len(train_val_df), NUM_CLASSES), np.nan, dtype=np.float32)
+    train_val_mask = train_val_df[clinical_cols].notna().any(axis=1).values
+
+    sgkf_inner = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    X_inner = np.zeros(len(train_val_df))
+    y_inner = train_val_df[label_col].values
+    groups_inner = train_val_df["PTID"].values
+
+    for train_idx, val_idx in sgkf_inner.split(X_inner, y_inner, groups_inner):
+        fold_train = train_val_df.iloc[train_idx]
+        fold_val = train_val_df.iloc[val_idx]
+
+        fold_train_mask = fold_train[clinical_cols].notna().any(axis=1).values
+        fold_val_mask = fold_val[clinical_cols].notna().any(axis=1).values
+
+        if fold_train_mask.sum() == 0 or fold_val_mask.sum() == 0:
+            continue
+
+        X_tr = fold_train.loc[fold_train_mask, clinical_cols].values
+        y_tr = fold_train.loc[fold_train_mask, label_col].values
+        X_va = fold_val.loc[fold_val_mask, clinical_cols].values
+
+        xgb_inner = XGBClassifier(
+            objective="binary:logistic",
+            eval_metric="logloss",
+            random_state=random_state,
+            n_jobs=4,
+            missing=np.nan
+        )
+        xgb_inner.fit(X_tr, y_tr)
+
+        actual_val_indices = np.where(fold_val_mask)[0]
+        val_df_global_indices = fold_val.index[actual_val_indices]
+        train_val_probs[val_df_global_indices] = xgb_inner.predict_proba(X_va)
+
+    xgb_final = XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=random_state,
+        n_jobs=4,
+        missing=np.nan
+    )
+
+    full_train_mask = train_val_df[clinical_cols].notna().any(axis=1).values
+    if full_train_mask.sum() > 0:
+        xgb_final.fit(
+            train_val_df.loc[full_train_mask, clinical_cols].values,
+            train_val_df.loc[full_train_mask, label_col].values
+        )
+
+    test_probs = np.full((len(test_df), NUM_CLASSES), np.nan, dtype=np.float32)
+    test_mask = test_df[clinical_cols].notna().any(axis=1).values
+    if test_mask.sum() > 0:
+        test_probs[test_mask] = xgb_final.predict_proba(
+            test_df.loc[test_mask, clinical_cols].values
+        )
+
+    return train_val_probs, train_val_mask, test_probs, test_mask, xgb_final
+
+# -----------------------------
+# Dataset
+# -----------------------------
+class MultimodalMRIDataset(Dataset):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        clinical_cols: List[str],
+        xgb_probs: np.ndarray,
+        clinical_present_mask: np.ndarray,
+        transform=None
+    ):
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+        self.xgb_probs = xgb_probs
+        self.clin_mask = clinical_present_mask.astype(np.float32)
+        self.clinical_cols = clinical_cols
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        try:
+            npy_data = np.load(row["path"])
+            img_tensor = torch.from_numpy(npy_data).float().unsqueeze(1)
+
+            if self.transform:
+                img_tensor = self.transform(img_tensor)
+
+            img_tensor = img_tensor.repeat(1, 3, 1, 1)
+        except Exception:
+            img_tensor = torch.zeros(9, 3, IMG_SIZE, IMG_SIZE, dtype=torch.float32)
+
+        probs = (
+            self.xgb_probs[idx]
+            if self.xgb_probs is not None
+            else np.full((NUM_CLASSES,), np.nan, dtype=np.float32)
+        )
+        mask = np.array([1.0], dtype=np.float32) if self.clin_mask[idx] else np.array([0.0], dtype=np.float32)
+        label = torch.tensor(row["label"], dtype=torch.long)
+
+        probs_tensor = torch.from_numpy(np.array(probs, dtype=np.float32))
+        mask_tensor = torch.from_numpy(mask)
+
+        return img_tensor, probs_tensor, mask_tensor, label
+
+# -----------------------------
+# Feature Extractors
+# -----------------------------
+class SharedDenseNetFeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        base = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
+        self.features = base.features
+        self.out_dim = base.classifier.in_features
+
+        for param in self.features.parameters():
+            param.requires_grad = False
+        for param in self.features.denseblock3.parameters():
+            param.requires_grad = True
+        for param in self.features.denseblock4.parameters():
+            param.requires_grad = True
+        for param in self.features.norm5.parameters():
+            param.requires_grad = True
+
+    def forward(self, x):
+        x = self.features(x)
+        x = F.relu(x, inplace=False)
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        return torch.flatten(x, 1)
+
+class SharedViTFeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = timm.create_model("vit_small_patch16_224", pretrained=True, num_classes=0)
+        self.out_dim = self.backbone.num_features
+
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        for param in self.backbone.blocks[-4:].parameters():
+            param.requires_grad = True
+        for param in self.backbone.norm.parameters():
+            param.requires_grad = True
+
+    def forward(self, x):
+        return self.backbone(x)
+
+# -----------------------------
+# Attention & Fusion Blocks (from Code 2)
+# -----------------------------
+class MissingClinicalEmbedding(nn.Module):
+    def __init__(self, n_probs: int, output_dim: int = 128):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(n_probs, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+            nn.Dropout(0.15)
+        )
+        self.missing_vector = nn.Parameter(torch.randn(1, output_dim) * 0.1)
+
+    def forward(self, clinical_proba: torch.Tensor, mask: torch.Tensor):
+        clinical_clean = torch.where(
+            torch.isnan(clinical_proba),
+            torch.zeros_like(clinical_proba),
+            clinical_proba
+        )
+        projected = self.proj(clinical_clean)
+        mask = mask.view(-1, 1).to(projected.dtype)
+        return mask * projected + (1.0 - mask) * self.missing_vector
+
+class SliceAttentionPooling(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim // 2),
+            nn.Tanh(),
+            nn.Linear(dim // 2, 1)
+        )
+
+    def forward(self, x: torch.Tensor):
+        attn_logits = self.score(x)
+        attn_weights = torch.softmax(attn_logits, dim=1)
+        pooled = torch.sum(x * attn_weights, dim=1)
+        return pooled, attn_weights
+
+class SelfAttentionFusion(nn.Module):
+    def __init__(self, feat_dim: int, attn_dim: int = 128, num_heads: int = 4):
+        super().__init__()
+        self.proj = nn.Linear(feat_dim, attn_dim) if feat_dim != attn_dim else nn.Identity()
+        self.mha = nn.MultiheadAttention(embed_dim=attn_dim, num_heads=num_heads, batch_first=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_proj = self.proj(x).unsqueeze(1)
+        attn_out, _ = self.mha(x_proj, x_proj, x_proj)
+        return attn_out.squeeze(1)
+
+class CrossSelfAttentionFusion(nn.Module):
+    def __init__(self, img_dim: int, clin_dim: int, attn_dim: int = 128, num_heads: int = 4, mode: str = "MM_SA_BA"):
+        super().__init__()
+        self.mode = mode
+        self.attn_dim = attn_dim
+        self.num_heads = num_heads
+
+        self.proj_img = nn.Linear(img_dim, attn_dim) if img_dim != attn_dim else nn.Identity()
+        self.proj_clin = nn.Linear(clin_dim, attn_dim) if clin_dim != attn_dim else nn.Identity()
+
+        self.mha = nn.MultiheadAttention(embed_dim=attn_dim, num_heads=num_heads, batch_first=True)
+
+    def single_self_attn(self, x: torch.Tensor) -> torch.Tensor:
+        x_seq = x.unsqueeze(1)
+        attn_out, _ = self.mha(x_seq, x_seq, x_seq)
+        return attn_out.squeeze(1)
+
+    def cross_attn_pair(self, q_in: torch.Tensor, kv_in: torch.Tensor) -> torch.Tensor:
+        q_seq = q_in.unsqueeze(1)
+        kv_seq = kv_in.unsqueeze(1)
+        out, _ = self.mha(q_seq, kv_seq, kv_seq)
+        return out.squeeze(1)
+
+    def forward(self, img_feat: torch.Tensor, clin_feat: torch.Tensor) -> torch.Tensor:
+        img_proj = self.proj_img(img_feat)
+        clin_proj = self.proj_clin(clin_feat)
+
+        if self.mode == "MM_BA":
+            vt_att = self.cross_attn_pair(img_proj, clin_proj)
+            av_att = self.cross_attn_pair(clin_proj, img_proj)
+            merged = torch.cat([vt_att, av_att, img_feat, clin_feat], dim=1)
+            return merged
+
+        elif self.mode == "MM_SA":
+            vv_att = self.single_self_attn(img_proj)
+            tt_att = self.single_self_attn(clin_proj)
+            merged = torch.cat([vv_att, tt_att, img_feat, clin_feat], dim=1)
+            return merged
+
+        elif self.mode == "MM_SA_BA":
+            vv_att = self.single_self_attn(img_proj)
+            tt_att = self.single_self_attn(clin_proj)
+            vt_att = self.cross_attn_pair(vv_att, tt_att)
+            av_att = self.cross_attn_pair(tt_att, vv_att)
+            merged = torch.cat([vt_att, av_att, vv_att, tt_att, img_feat, clin_feat], dim=1)
+            return merged
+
+        elif self.mode == "None":
+            return torch.cat([img_feat, clin_feat], dim=1)
+        else:
+            raise ValueError(f"Unsupported attention mode: {self.mode}")
+
+# -----------------------------
+# Main Architecture with Cross-Self Fusion
+# -----------------------------
+class SharedEncoderFusionModel(nn.Module):
+    def __init__(
+        self,
+        num_classes=2,
+        num_slices=9,
+        slice_proj_dim=256,
+        clinical_dim=128,
+        attn_dim=128,
+        attention_mode="MM_SA_BA"
+    ):
+        super().__init__()
+        self.num_slices = num_slices
+        self.slice_proj_dim = slice_proj_dim
+        self.clinical_dim = clinical_dim
+        self.attn_dim = attn_dim
+        self.attention_mode = attention_mode
+
+        # Encoders
+        self.shared_cnn = SharedDenseNetFeatureExtractor()
+        self.shared_vit = SharedViTFeatureExtractor()
+
+        self.cnn_proj = nn.Sequential(
+            nn.LayerNorm(self.shared_cnn.out_dim),
+            nn.Linear(self.shared_cnn.out_dim, slice_proj_dim),
+            nn.GELU()
+        )
+        self.vit_proj = nn.Sequential(
+            nn.LayerNorm(self.shared_vit.out_dim),
+            nn.Linear(self.shared_vit.out_dim, slice_proj_dim),
+            nn.GELU()
+        )
+
+        self.slice_fusion = nn.Sequential(
+            nn.LayerNorm(2 * slice_proj_dim),
+            nn.Linear(2 * slice_proj_dim, slice_proj_dim),
+            nn.GELU(),
+            nn.Dropout(0.15)
+        )
+
+        # Self-Attention across Slices
+        self.slice_self_attn = SelfAttentionFusion(
+            feat_dim=slice_proj_dim,
+            attn_dim=slice_proj_dim,
+            num_heads=8
+        )
+        self.slice_attention_pool = SliceAttentionPooling(dim=slice_proj_dim)
+
+        # Tabular/Clinical Embedding
+        self.clinical_embed = MissingClinicalEmbedding(
+            n_probs=num_classes,
+            output_dim=clinical_dim
+        )
+
+        # Cross & Self Attention Fusion between MRI and Clinical
+        self.multimodal_fusion = CrossSelfAttentionFusion(
+            img_dim=slice_proj_dim,
+            clin_dim=clinical_dim,
+            attn_dim=attn_dim,
+            num_heads=8,
+            mode=attention_mode
+        )
+
+        # Output Dimension Calculation
+        if attention_mode == "MM_SA_BA":
+            fused_dim = (4 * attn_dim) + slice_proj_dim + clinical_dim
+        elif attention_mode in ["MM_BA", "MM_SA"]:
+            fused_dim = (2 * attn_dim) + slice_proj_dim + clinical_dim
+        else:
+            fused_dim = slice_proj_dim + clinical_dim
+
+        # Final Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(fused_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.35),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.25),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, img, clinical_proba, clin_mask):
+        batch_size, num_slices, channels, height, width = img.shape
+
+        img_flat = img.view(batch_size * num_slices, channels, height, width)
+
+        cnn_feats = self.shared_cnn(img_flat)
+        vit_feats = self.shared_vit(img_flat)
+
+        cnn_feats_proj = self.cnn_proj(cnn_feats)
+        vit_feats_proj = self.vit_proj(vit_feats)
+
+        slice_combined = torch.cat([cnn_feats_proj, vit_feats_proj], dim=1)
+        slice_fused = self.slice_fusion(slice_combined)
+
+        # Refine slice representations with self-attention
+        slice_fused_refined = self.slice_self_attn(slice_fused)
+        slice_fused_refined = slice_fused_refined.view(batch_size, num_slices, self.slice_proj_dim)
+
+        # Pool across slices
+        mri_feats, _ = self.slice_attention_pool(slice_fused_refined)
+
+        # Clinical features
+        clin_feats = self.clinical_embed(clinical_proba, clin_mask)
+
+        # Bi-directional Cross & Self Attention Fusion
+        fused_feats = self.multimodal_fusion(mri_feats, clin_feats)
+        logits = self.classifier(fused_feats)
+
+        return logits
+
+def freeze_non_trainable_batch_norm(model):
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            has_trainable_parameter = any(
+                parameter.requires_grad for parameter in module.parameters()
+            )
+            if not has_trainable_parameter:
+                module.eval()
+
+# -----------------------------
+# Train / Eval
+# -----------------------------
+def run_epoch(model, loader, criterion, optimizer=None):
+    is_training = optimizer is not None
+
+    if is_training:
+        model.train()
+        freeze_non_trainable_batch_norm(model)
+    else:
+        model.eval()
+
+    total_loss = 0.0
+    all_predictions = []
+    all_labels = []
+    all_outputs = []
+
+    context = torch.enable_grad() if is_training else torch.no_grad()
+
+    with context:
+        for imgs, clin_probas, clin_masks, labels in loader:
+            imgs = imgs.to(DEVICE, non_blocking=PIN_MEMORY)
+            clin_probas = clin_probas.to(DEVICE, non_blocking=PIN_MEMORY)
+            clin_masks = clin_masks.to(DEVICE, non_blocking=PIN_MEMORY)
+            labels = labels.to(DEVICE, non_blocking=PIN_MEMORY)
+
+            if is_training:
+                optimizer.zero_grad(set_to_none=True)
+
+            outputs = model(imgs, clin_probas, clin_masks)
+            loss = criterion(outputs, labels)
+
+            if is_training:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    max_norm=5.0
+                )
+                optimizer.step()
+
+            total_loss += loss.item() * imgs.size(0)
+            probs = F.softmax(outputs, dim=1)
+            #predictions = torch.argmax(outputs, dim=1)
+            predictions = (probs[:, 1] >= 0.47).long()
+
+            all_predictions.extend(predictions.detach().cpu().numpy())
+            all_labels.extend(labels.detach().cpu().numpy())
+            all_outputs.extend(probs.detach().cpu().numpy())
+
+    average_loss = total_loss / len(loader.dataset)
+    acc = accuracy_score(all_labels, all_predictions)
+
+    return (
+        average_loss,
+        acc,
+        np.array(all_labels),
+        np.array(all_predictions),
+        np.array(all_outputs)
+    )
+
+# -----------------------------
+# Metrics
+# -----------------------------
+def calculate_detailed_metrics(y_true, y_pred):
+    bal_acc = balanced_accuracy_score(y_true, y_pred)
+    labels = [0, 1]
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+
+    precision, recall, f1_per_class, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=labels, zero_division=0
+    )
+
+    specificity = []
+    for idx in labels:
+        tp = cm[idx, idx]
+        fn = cm[idx, :].sum() - tp
+        fp = cm[:, idx].sum() - tp
+        tn = cm.sum() - tp - fp - fn
+        spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        specificity.append(spec)
+
+    return {
+        "balanced_accuracy": bal_acc,
+        "precision_class": precision,
+        "sensitivity_class": recall,
+        "specificity_class": specificity,
+        "f1_class": f1_per_class,
+        "macro_precision": np.mean(precision),
+        "macro_f1": np.mean(f1_per_class),
+        "confusion_matrix": cm
+    }
+
+# -----------------------------
+# Main Runner
+# -----------------------------
+def main():
+    set_seed(SEED)
+    print(f"Device: {DEVICE}")
+
+    samples_df = build_samples_from_csv(CSV_PATH, DATA_DIR, LABEL_COLUMN)
+    print(f"Total matched samples after cleanup: {len(samples_df)}")
+
+    if len(samples_df) == 0:
+        raise ValueError("هیچ نمونه‌ی متناظری یافت نشد. مسیرها و پسوند فایل‌ها را بررسی کنید.")
+
+    samples_df = samples_df.reset_index(drop=True)
+    outer_sgkf = StratifiedGroupKFold(n_splits=N_OUTER_SPLITS, shuffle=True, random_state=SEED)
+
+    samples_df["fold"] = -1
+    for fold_id, (_, test_idx) in enumerate(
+        outer_sgkf.split(np.zeros(len(samples_df)), samples_df["label"].values, samples_df["PTID"].values)
+    ):
+        samples_df.loc[test_idx, "fold"] = fold_id
+
+    samples_df[["source_file_name", "PTID", "IMAGEID", "label", "fold"]].to_csv(
+        "canonical_folds.csv", index=False
+    )
+    print("Saved canonical fold assignments -> canonical_folds.csv")
+
+    outer_results = []
+    all_oof_true = []
+    all_oof_pred = []
+    all_oof_probs = []
+
+    print(f"\n--- Starting {N_OUTER_SPLITS}-Fold Cross-Validation with CrossSelfAttentionFusion ---")
+
+    for fold in range(N_OUTER_SPLITS):
+        print(f"\n==================== FOLD {fold + 1} / {N_OUTER_SPLITS} ====================")
+
+        test_df = samples_df[samples_df["fold"] == fold].copy().reset_index(drop=True)
+        train_val_df = samples_df[samples_df["fold"] != fold].copy().reset_index(drop=True)
+
+        inner_sgkf = StratifiedGroupKFold(n_splits=4, shuffle=True, random_state=SEED)
+        X_inner = np.zeros(len(train_val_df))
+        y_inner = train_val_df["label"].values
+        groups_inner = train_val_df["PTID"].values
+        train_idx, val_idx = next(inner_sgkf.split(X_inner, y_inner, groups_inner))
+
+        train_df = train_val_df.iloc[train_idx].reset_index(drop=True)
+        val_df = train_val_df.iloc[val_idx].reset_index(drop=True)
+
+        train_val_probs, train_val_mask, test_probs, test_mask, _ = get_oof_clinical_predictions(
+            train_val_df=train_val_df,
+            test_df=test_df,
+            clinical_cols=CLINICAL_COLS,
+            label_col="label",
+            n_splits=5,
+            random_state=SEED
+        )
+
+        train_probs = train_val_probs[train_idx]
+        train_present_mask = train_val_mask[train_idx]
+        val_probs = train_val_probs[val_idx]
+        val_present_mask = train_val_mask[val_idx]
+
+        train_dataset = MultimodalMRIDataset(
+            train_df, CLINICAL_COLS, train_probs, train_present_mask, transform=train_transform
+        )
+        val_dataset = MultimodalMRIDataset(
+            val_df, CLINICAL_COLS, val_probs, val_present_mask, transform=val_transform
+        )
+        test_dataset = MultimodalMRIDataset(
+            test_df, CLINICAL_COLS, test_probs, test_mask, transform=val_transform
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=PIN_MEMORY,
+            drop_last=True
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=PIN_MEMORY,
+            drop_last=False
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=PIN_MEMORY,
+            drop_last=False
+        )
+
+        model = SharedEncoderFusionModel(
+            num_classes=NUM_CLASSES,
+            num_slices=9,
+            slice_proj_dim=256,
+            clinical_dim=128,
+            attn_dim=128,
+            attention_mode="MM_SA_BA"
+        ).to(DEVICE)
+
+       
+        custom_class_weights = torch.tensor([0.95, 1.25], dtype=torch.float32).to(DEVICE)
+        criterion = nn.CrossEntropyLoss(weight=custom_class_weights, label_smoothing=0.03)
+
+        optimizer = optim.AdamW(
+            [
+                {"params": model.shared_cnn.features.denseblock3.parameters(), "lr": 5e-6},
+                {"params": model.shared_cnn.features.denseblock4.parameters(), "lr": 1e-5},
+                {"params": model.shared_cnn.features.norm5.parameters(), "lr": 1e-5},
+                {"params": model.shared_vit.backbone.blocks[-4:].parameters(), "lr": 8e-6},
+                {"params": model.shared_vit.backbone.norm.parameters(), "lr": 8e-6},
+                {"params": model.cnn_proj.parameters(), "lr": 2e-5},
+                {"params": model.vit_proj.parameters(), "lr": 2e-5},
+                {"params": model.slice_fusion.parameters(), "lr": 2e-5},
+                {"params": model.slice_self_attn.parameters(), "lr": 2e-5},
+                {"params": model.slice_attention_pool.parameters(), "lr": 3e-5},
+                {"params": model.clinical_embed.parameters(), "lr": 5e-5},
+                {"params": model.multimodal_fusion.parameters(), "lr": 5e-5},
+                {"params": model.classifier.parameters(), "lr": 5e-5},
+            ],
+            weight_decay=1e-2,
+        )
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=EPOCHS,
+            eta_min=1e-6
+        )
+
+        best_validation_macro_f1 = -1.0
+        best_model_weights = copy.deepcopy(model.state_dict())
+        patience_counter = 0
+        fold_checkpoint_path = f"best_cross_attention_fold_{fold + 1}.pth"
+
+        for epoch in range(EPOCHS):
+            train_loss, train_accuracy, _, _, _ = run_epoch(model, train_loader, criterion, optimizer)
+            val_loss, val_accuracy, val_labels, val_predictions, _ = run_epoch(model, val_loader, criterion)
+
+            val_macro_f1 = f1_score(val_labels, val_predictions, average="macro", zero_division=0)
+            scheduler.step()
+
+            print(
+                f"Fold {fold + 1:02d} | Epoch {epoch + 1:02d}/{EPOCHS} | "
+                f"Train Loss={train_loss:.4f} | Train Acc={train_accuracy:.4f} | "
+                f"Val Loss={val_loss:.4f} | Val Acc={val_accuracy:.4f} | Val Macro-F1={val_macro_f1:.4f}"
+            )
+
+            if val_macro_f1 > best_validation_macro_f1 + 1e-6:
+                best_validation_macro_f1 = val_macro_f1
+                best_model_weights = copy.deepcopy(model.state_dict())
+                torch.save(best_model_weights, fold_checkpoint_path)
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= EARLY_STOPPING_PATIENCE:
+                print(f"Early stopping triggered at epoch {epoch + 1}")
+                break
+
+        model.load_state_dict(torch.load(fold_checkpoint_path, map_location=DEVICE))
+        test_loss, test_accuracy, y_true_test, y_pred_test, y_probs_test = run_epoch(
+            model, test_loader, criterion
+        )
+
+        test_macro_f1 = f1_score(y_true_test, y_pred_test, average="macro", zero_division=0)
+        if len(np.unique(y_true_test)) == 2:
+            test_macro_auc = roc_auc_score(y_true_test, y_probs_test[:, 1])
+        else:
+            test_macro_auc = np.nan
+
+        detailed = calculate_detailed_metrics(y_true_test, y_pred_test)
+
+        print(
+            f"[Fold {fold + 1} Finished] "
+            f"Test Loss={test_loss:.4f} | Test Acc={test_accuracy:.4f} | "
+            f"Bal Acc={detailed['balanced_accuracy']:.4f} | "
+            f"Macro F1={test_macro_f1:.4f} | Macro AUC={test_macro_auc:.4f}"
+        )
+
+        all_oof_true.extend(y_true_test.tolist())
+        all_oof_pred.extend(y_pred_test.tolist())
+        all_oof_probs.append(y_probs_test)
+
+        outer_results.append({
+            "accuracy": test_accuracy,
+            "balanced_accuracy": detailed["balanced_accuracy"],
+            "macro_precision": detailed["macro_precision"],
+            "macro_f1": test_macro_f1,
+            "macro_auc": test_macro_auc,
+
+            "precision_sMCI": detailed["precision_class"][0],
+            "precision_pMCI": detailed["precision_class"][1],
+
+            "sens_sMCI": detailed["sensitivity_class"][0],
+            "sens_pMCI": detailed["sensitivity_class"][1],
+
+            "spec_sMCI": detailed["specificity_class"][0],
+            "spec_pMCI": detailed["specificity_class"][1],
+
+            "f1_sMCI": detailed["f1_class"][0],
+            "f1_pMCI": detailed["f1_class"][1],
+        })
+
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    all_oof_true = np.asarray(all_oof_true)
+    all_oof_pred = np.asarray(all_oof_pred)
+    all_oof_probs = np.vstack(all_oof_probs)
+
+    oof_cm = confusion_matrix(all_oof_true, all_oof_pred, labels=[0, 1])
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(
+        oof_cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=CLASS_NAMES,
+        yticklabels=CLASS_NAMES
+    )
+    plt.xlabel("Predicted class")
+    plt.ylabel("True class")
+    plt.title("Out-of-Fold Confusion Matrix (Cross-Self Attention Fusion)")
+    plt.tight_layout()
+    plt.savefig("oof_confusion_matrix_cross_attention.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print("\n[Saved] Confusion matrix saved to 'oof_confusion_matrix_cross_attention.png'")
+
+    def bootstrap_ci_binary(y_true, y_pred, y_probs, n_bootstraps=1000, seed=42):
+        rng = np.random.default_rng(seed)
+        boot_metrics = {
+            "accuracy": [],
+            "balanced_accuracy": [],
+            "macro_precision": [],
+            "macro_f1": [],
+            "macro_auc": []
+        }
+
+        n_samples = len(y_true)
+        for _ in range(n_bootstraps):
+            indices = rng.choice(n_samples, size=n_samples, replace=True)
+            y_t_b = y_true[indices]
+            y_p_b = y_pred[indices]
+            y_pr_b = y_probs[indices]
+
+            if len(np.unique(y_t_b)) < 2:
+                continue
+
+            boot_metrics["accuracy"].append(accuracy_score(y_t_b, y_p_b))
+            boot_metrics["balanced_accuracy"].append(balanced_accuracy_score(y_t_b, y_p_b))
+
+            precision, _, f1_vals, _ = precision_recall_fscore_support(
+                y_t_b, y_p_b, labels=[0, 1], zero_division=0
+            )
+            boot_metrics["macro_precision"].append(np.mean(precision))
+            boot_metrics["macro_f1"].append(np.mean(f1_vals))
+            boot_metrics["macro_auc"].append(roc_auc_score(y_t_b, y_pr_b[:, 1]))
+
+        ci_results = {}
+        for metric_name, values in boot_metrics.items():
+            values = np.asarray(values, dtype=float)
+            if len(values) == 0:
+                ci_results[metric_name] = (np.nan, np.nan)
+                continue
+            ci_low, ci_high = np.percentile(values, [2.5, 97.5])
+            ci_results[metric_name] = (ci_low, ci_high)
+
+        return ci_results
+
+    print("\nCalculating 95% Bootstrap Confidence Intervals (1000 iterations)...")
+    boot_ci = bootstrap_ci_binary(
+        all_oof_true,
+        all_oof_pred,
+        all_oof_probs,
+        n_bootstraps=1000,
+        seed=SEED
+    )
+
+    print("\n" + "=" * 25 + " Final Cross-Validation Detailed Metrics " + "=" * 25)
+
+    metrics_to_report = [
+        "accuracy",
+        "balanced_accuracy",
+        "macro_precision",
+        "macro_f1",
+        "macro_auc",
+        "precision_sMCI",
+        "precision_pMCI",
+        "sens_sMCI",
+        "sens_pMCI",
+        "spec_sMCI",
+        "spec_pMCI",
+        "f1_sMCI",
+        "f1_pMCI"
+    ]
+
+    for metric in metrics_to_report:
+        values = [res[metric] for res in outer_results]
+        mean_val = np.mean(values)
+        sd_val = np.std(values)
+
+        if metric in boot_ci:
+            ci_low, ci_high = boot_ci[metric]
+            print(
+                f"Overall {metric:20s}: {mean_val:.4f} ± {sd_val:.4f}  "
+                f"(Bootstrap 95% CI: [{ci_low:.4f}, {ci_high:.4f}])"
+            )
+        else:
+            ci_err = 1.96 * (sd_val / np.sqrt(N_OUTER_SPLITS))
+            print(
+                f"Overall {metric:20s}: {mean_val:.4f} ± {sd_val:.4f}  "
+                f"(95% CI: [{mean_val - ci_err:.4f}, {mean_val + ci_err:.4f}])"
+            )
+
+    print("\n" + "=" * 25 + " Binary Classification Performance: sMCI vs pMCI " + "=" * 25)
+
+if __name__ == "__main__":
+    main()
