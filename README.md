@@ -1,0 +1,1 @@
+The data used in this study are publicly available through the Alzheimer’s Disease Neuroimaging Initiative (ADNI) database (adni.loni.usc.edu). Access to the data can be obtained upon application to the ADNI database.
